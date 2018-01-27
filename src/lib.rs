@@ -45,7 +45,6 @@ use std::borrow::{Borrow, Cow};
 use std::cmp;
 use std::fmt;
 use std::hash::{Hash, Hasher};
-use std::mem;
 use std::ops::{self, Deref};
 use std::path;
 
@@ -83,28 +82,66 @@ macro_rules! scan_forward {
     }}
 }
 
+fn split_file_at_dot(input: &str) -> (Option<&str>, Option<&str>) {
+    if input == PARENT {
+        return (Some(input), None);
+    }
+
+    let mut iter = input.rsplitn(2, '.');
+
+    let after = iter.next();
+    let before = iter.next();
+
+    if before == Some("") {
+        (Some(input), None)
+    } else {
+        (before, after)
+    }
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Component<'a> {
+    CurDir,
+    ParentDir,
+    Normal(&'a str),
+}
+
+impl<'a> Component<'a> {
+    pub fn as_str(&self) -> &'a str {
+        use self::Component::*;
+
+        match *self {
+            CurDir => CURRENT,
+            ParentDir => PARENT,
+            Normal(name) => name,
+        }
+    }
+}
+
 /// Traverse the given components and apply to the provided stack.
 ///
 /// This takes '.', and '..' into account. Where '.' doesn't change the stack, and '..' pops the
 /// last item or further adds parent components.
 #[inline(always)]
-fn relative_traversal<'a, C>(stack: &mut Vec<&'a str>, components: C)
-    where C: IntoIterator<Item = &'a str>
+fn relative_traversal<'a, C>(stack: &mut Vec<Component<'a>>, components: C)
+    where C: IntoIterator<Item = Component<'a>>
 {
+    use self::Component::*;
+
     for c in components.into_iter() {
         match c {
-            PARENT => {
+            ParentDir => {
                 match stack.last() {
-                    Some(&PARENT) | None => {
-                        stack.push(PARENT);
+                    Some(&ParentDir) | None => {
+                        stack.push(ParentDir);
                     }
                     _ => {
                         stack.pop();
                     }
                 }
             },
-            CURRENT => {},
-            c => stack.push(c),
+            CurDir => {},
+            Normal(name) => stack.push(Normal(name)),
         }
     }
 }
@@ -116,7 +153,7 @@ pub struct Components<'a> {
 }
 
 impl<'a> Iterator for Components<'a> {
-    type Item = &'a str;
+    type Item = Component<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.source.is_empty() {
@@ -137,7 +174,13 @@ impl<'a> Iterator for Components<'a> {
             return None;
         }
 
-        Some(unsafe { ::std::str::from_utf8_unchecked(slice) })
+        let slice = unsafe { ::std::str::from_utf8_unchecked(slice) };
+
+        match slice {
+            "." => Some(Component::CurDir),
+            ".." => Some(Component::ParentDir),
+            slice => Some(Component::Normal(slice)),
+        }
     }
 }
 
@@ -153,7 +196,7 @@ impl<'a> Components<'a> {
     }
 
     /// Extracts the next back component and its length including separators.
-    fn next_back_component(&mut self) -> Option<(&'a str, usize)> {
+    fn next_back_component(&mut self) -> Option<(Component<'a>, usize)> {
         if self.source.is_empty() {
             return None;
         }
@@ -175,7 +218,14 @@ impl<'a> Components<'a> {
         }
 
         let slice = unsafe { ::std::str::from_utf8_unchecked(slice) };
-        Some((slice, slice_end - slice_start))
+
+        let w = slice_end - slice_start;
+
+        match slice {
+            "." => Some((Component::CurDir, w)),
+            ".." => Some((Component::ParentDir, w)),
+            slice => Some((Component::Normal(slice), w)),
+        }
     }
 }
 
@@ -197,6 +247,10 @@ impl RelativePathBuf {
     /// Create a new relative path buffer.
     pub fn new() -> RelativePathBuf {
         RelativePathBuf { inner: String::new() }
+    }
+
+    fn as_mut_vec(&mut self) -> &mut Vec<u8> {
+        unsafe { &mut *(self as *mut RelativePathBuf as *mut Vec<u8>) }
     }
 
     /// Extends `self` with `path`.
@@ -228,6 +282,81 @@ impl RelativePathBuf {
         }
 
         self.inner.push_str(&other.inner)
+    }
+
+    /// Updates [`self.file_name`] to `file_name`.
+    ///
+    /// If [`self.file_name`] was `None`, this is equivalent to pushing
+    /// `file_name`.
+    ///
+    /// Otherwise it is equivalent to calling [`pop`] and then pushing
+    /// `file_name`. The new path will be a sibling of the original path.
+    /// (That is, it will have the same parent.)
+    ///
+    /// [`self.file_name`]: struct.RelativePathBuf.html#method.file_name
+    /// [`pop`]: struct.RelativePathBuf.html#method.pop
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use relative_path::RelativePathBuf;
+    ///
+    /// let mut buf = RelativePathBuf::from("");
+    /// assert!(buf.file_name() == None);
+    /// buf.set_file_name("bar");
+    /// assert_eq!(RelativePathBuf::from("bar"), buf);
+    ///
+    /// assert!(buf.file_name().is_some());
+    /// buf.set_file_name("baz.txt");
+    /// assert_eq!(RelativePathBuf::from("baz.txt"), buf);
+    ///
+    /// buf.push("bar");
+    /// assert!(buf.file_name().is_some());
+    /// buf.set_file_name("bar.txt");
+    /// assert_eq!(RelativePathBuf::from("baz.txt/bar.txt"), buf);
+    /// ```
+    pub fn set_file_name<S: AsRef<str>>(&mut self, file_name: S) {
+        let file_name = file_name.as_ref();
+
+        if self.file_name().is_some() {
+            if !self.pop() {
+                self.inner = file_name.to_string();
+                return;
+            }
+        }
+
+        self.push(file_name);
+    }
+
+    /// Truncates `self` to [`self.parent`].
+    ///
+    /// Returns `false` and does nothing if [`self.file_name`] is [`None`].
+    /// Otherwise, returns `true`.
+    ///
+    /// [`None`]: ../../std/option/enum.Option.html#variant.None
+    /// [`self.parent`]: struct.PathBuf.html#method.parent
+    /// [`self.file_name`]: struct.PathBuf.html#method.file_name
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use relative_path::{RelativePath, RelativePathBuf};
+    ///
+    /// let mut p = RelativePathBuf::from("test/test.rs");
+    ///
+    /// assert_eq!(true, p.pop());
+    /// assert_eq!(RelativePath::new("test"), p);
+    /// assert_eq!(false, p.pop());
+    /// assert_eq!(RelativePath::new("test"), p);
+    /// ```
+    pub fn pop(&mut self) -> bool {
+        match self.parent().map(|p| p.as_u8_slice().len()) {
+            Some(len) => {
+                self.as_mut_vec().truncate(len);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Coerce to a [`RelativePath`] slice.
@@ -316,7 +445,12 @@ pub struct RelativePath {
 impl RelativePath {
     /// Directly wraps a string slice as a `RelativePath` slice.
     pub fn new<S: AsRef<str> + ?Sized>(s: &S) -> &RelativePath {
-        unsafe { mem::transmute(s.as_ref()) }
+        unsafe { &*(s.as_ref() as *const str as *const RelativePath) }
+    }
+
+    // The following (private!) function reveals the byte encoding used for OsStr.
+    fn as_u8_slice(&self) -> &[u8] {
+        unsafe { &*(&self.inner as *const str as *const [u8]) }
     }
 
     /// Yields the underlying `str` slice.
@@ -378,14 +512,14 @@ impl RelativePath {
     /// # Examples
     ///
     /// ```rust
-    /// use relative_path::RelativePath;
+    /// use relative_path::{Component, RelativePath};
     ///
     /// let path = RelativePath::new("foo/bar/baz");
     /// let mut it = path.components();
     ///
-    /// assert_eq!(Some("foo"), it.next());
-    /// assert_eq!(Some("bar"), it.next());
-    /// assert_eq!(Some("baz"), it.next());
+    /// assert_eq!(Some(Component::Normal("foo")), it.next());
+    /// assert_eq!(Some(Component::Normal("bar")), it.next());
+    /// assert_eq!(Some(Component::Normal("baz")), it.next());
     /// assert_eq!(None, it.next());
     /// ```
     pub fn components(&self) -> Components {
@@ -412,7 +546,7 @@ impl RelativePath {
     /// ```
     pub fn to_path<P: AsRef<path::Path>>(&self, relative_to: P) -> path::PathBuf {
         let mut p = relative_to.as_ref().to_path_buf();
-        p.extend(self.components());
+        p.extend(self.components().map(|c| c.as_str()));
         p
     }
 
@@ -428,8 +562,9 @@ impl RelativePath {
     /// ```rust
     /// use relative_path::RelativePath;
     ///
-    /// let path = RelativePath::new("foo/bar");
-    /// assert_eq!(Some(RelativePath::new("foo")), path.parent());
+    /// assert_eq!(Some(RelativePath::new("foo")), RelativePath::new("foo/bar").parent());
+    /// assert_eq!(None, RelativePath::new("foo").parent());
+    /// assert_eq!(None, RelativePath::new("").parent());
     /// ```
     pub fn parent(&self) -> Option<&RelativePath> {
         self.components().next_back_component().and_then(
@@ -437,12 +572,97 @@ impl RelativePath {
                 let slice = &self.inner[..self.inner.len() - size];
 
                 if slice.is_empty() {
-                    None
-                } else {
-                    Some(RelativePath::new(slice))
+                    return None;
                 }
+
+                Some(RelativePath::new(slice))
             },
         )
+    }
+
+    /// Returns the final component of the `RelativePath`, if there is one.
+    ///
+    /// If the path is a normal file, this is the file name. If it's the path of a directory, this
+    /// is the directory name.
+    ///
+    /// Returns `None` If the path terminates in `..`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use relative_path::RelativePath;
+    ///
+    /// assert_eq!(Some("bin"), RelativePath::new("usr/bin/").file_name());
+    /// assert_eq!(Some("foo.txt"), RelativePath::new("tmp/foo.txt").file_name());
+    /// assert_eq!(Some("foo.txt"), RelativePath::new("tmp/foo.txt/").file_name());
+    /// assert_eq!(Some("foo.txt"), RelativePath::new("foo.txt/.").file_name());
+    /// assert_eq!(Some("foo.txt"), RelativePath::new("foo.txt/.//").file_name());
+    /// assert_eq!(None, RelativePath::new("foo.txt/..").file_name());
+    /// assert_eq!(None, RelativePath::new("/").file_name());
+    /// ```
+    pub fn file_name(&self) -> Option<&str> {
+        use self::Component::*;
+
+        let mut c = self.components();
+
+        while let Some(p) = c.next_back() {
+            match p {
+                Normal(name) => return Some(name),
+                CurDir => continue,
+                _ => return None,
+            }
+        }
+
+        None
+    }
+
+    /// Extracts the stem (non-extension) portion of [`self.file_name`].
+    ///
+    /// [`self.file_name`]: struct.RelativePath.html#method.file_name
+    ///
+    /// The stem is:
+    ///
+    /// * `None`, if there is no file name;
+    /// * The entire file name if there is no embedded `.`;
+    /// * The entire file name if the file name begins with `.` and has no other `.`s within;
+    /// * Otherwise, the portion of the file name before the final `.`
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use relative_path::RelativePath;
+    ///
+    /// let path = RelativePath::new("foo.rs");
+    ///
+    /// assert_eq!("foo", path.file_stem().unwrap());
+    /// ```
+    pub fn file_stem(&self) -> Option<&str> {
+        self.file_name().map(split_file_at_dot).and_then(|(before, after)| before.or(after))
+    }
+
+    /// Extracts the extension of [`self.file_name`], if possible.
+    ///
+    /// The extension is:
+    ///
+    /// * `None`, if there is no file name;
+    /// * `None`, if there is no embedded `.`;
+    /// * `None`, if the file name begins with `.` and has no other `.`s within;
+    /// * Otherwise, the portion of the file name after the final `.`
+    ///
+    /// [`self.file_name`]: struct.RelativePath.html#method.file_name
+    /// [`None`]: ../../std/option/enum.Option.html#variant.None
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use relative_path::RelativePath;
+    ///
+    /// assert_eq!(Some("rs"), RelativePath::new("foo.rs").extension());
+    /// assert_eq!(None, RelativePath::new(".rs").extension());
+    /// assert_eq!(Some("rs"), RelativePath::new("foo.rs/.").extension());
+    /// ```
+    pub fn extension(&self) -> Option<&str> {
+        self.file_name().map(split_file_at_dot).and_then(|(before, after)| before.and(after))
     }
 
     /// Return a relative path, resolved from the current path.
@@ -461,7 +681,8 @@ impl RelativePath {
         let mut stack = Vec::new();
         relative_traversal(&mut stack, self.components());
         relative_traversal(&mut stack, path.as_ref().components());
-        RelativePathBuf::from(stack.join("/"))
+        let string = stack.into_iter().map(|c| c.as_str()).collect::<Vec<_>>().join("/");
+        RelativePathBuf::from(string)
     }
 
     /// Return a relative path, resolved from the current path by removing all relative components.
@@ -479,7 +700,8 @@ impl RelativePath {
     pub fn relativize(&self) -> RelativePathBuf {
         let mut stack = Vec::new();
         relative_traversal(&mut stack, self.components());
-        RelativePathBuf::from(stack.join("/"))
+        let string = stack.into_iter().map(|c| c.as_str()).collect::<Vec<_>>().join("/");
+        RelativePathBuf::from(string)
     }
 }
 
@@ -704,8 +926,9 @@ mod tests {
     use super::*;
 
     fn assert_components(components: &[&str], path: &RelativePath) {
+        let components = components.iter().cloned().map(Component::Normal).collect::<Vec<_>>();
         let result: Vec<_> = path.components().collect();
-        assert_eq!(components, &result[..]);
+        assert_eq!(&components[..], &result[..]);
     }
 
     fn rp(input: &str) -> &RelativePath {
@@ -724,8 +947,10 @@ mod tests {
 
     #[test]
     fn test_components_iterator() {
+        use self::Component::*;
+
         assert_eq!(
-            vec!["hello", "world"],
+            vec![Normal("hello"), Normal("world")],
             rp("/hello///world//").components().collect::<Vec<_>>()
         );
     }
@@ -748,26 +973,22 @@ mod tests {
 
     #[test]
     fn test_next_back() {
+        use self::Component::*;
+
         let mut it = rp("baz/bar///foo").components();
-        assert_eq!(Some("foo"), it.next_back());
-        assert_eq!(Some("bar"), it.next_back());
-        assert_eq!(Some("baz"), it.next_back());
+        assert_eq!(Some(Normal("foo")), it.next_back());
+        assert_eq!(Some(Normal("bar")), it.next_back());
+        assert_eq!(Some(Normal("baz")), it.next_back());
         assert_eq!(None, it.next_back());
     }
 
     #[test]
     fn test_parent() {
-        let path = rp("/baz//bar/foo//");
-        assert_eq!(Some(rp("/baz/bar")), path.parent());
-        assert_eq!(
-            Some(rp("/baz")),
-            path.parent().and_then(RelativePath::parent)
-        );
-        assert_eq!(
-            None,
-            path.parent().and_then(RelativePath::parent).and_then(
-                RelativePath::parent,
-            )
+        let path = rp("baz//bar/foo//");
+        assert_eq!(Some(rp("baz/bar")), path.parent());
+        assert_eq!(Some(rp("baz")), path.parent().and_then(RelativePath::parent));
+        assert_eq!(None,
+            path.parent().and_then(RelativePath::parent).and_then(RelativePath::parent)
         );
     }
 
